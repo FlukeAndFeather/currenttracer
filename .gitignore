@@ -1,0 +1,10 @@
+__pycache__/
+*.egg-info/
+dist/
+.venv/
+venv/
+.DS_Store
+data/*
+!data/README.md
+tests/output/
+.env
