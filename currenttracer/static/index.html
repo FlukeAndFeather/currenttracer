@@ -20,11 +20,16 @@
         <input id="duration" type="number" value="30" min="1" max="365" style="width:60px">
     </label>
     <label>
+        Max tracers:
+        <input id="maxTracers" type="number" value="5" min="1" max="20" style="width:50px">
+    </label>
+    <label>
         Speed:
         <input id="speed" type="range" min="1" max="15" value="3" style="width:100px">
     </label>
+    <button id="go" disabled style="margin-top:4px;cursor:pointer;font-weight:bold">Go!</button>
     <button id="reset" style="margin-top:4px;cursor:pointer">Reset</button>
-    <div style="font-size:12px;color:#aaa">Click the ocean to drop a tracer.</div>
+    <div id="hint" style="font-size:12px;color:#aaa">Click the ocean to place tracers, then hit Go!</div>
 </div>
 
 <div id="status"></div>
@@ -51,26 +56,43 @@
     const statusEl = document.getElementById('status');
     const durationEl = document.getElementById('duration');
     const speedEl = document.getElementById('speed');
+    const goBtn = document.getElementById('go');
+    const hintEl = document.getElementById('hint');
+    const maxTracersEl = document.getElementById('maxTracers');
 
-    // --- Shared timeline state ---
-    // globalTime is in hours, matching the t_hours in trajectory data.
+    // --- State machine: PLACING | COMPUTING | ANIMATING | DONE ---
+    let state = 'PLACING';
     let globalTime = 0;
-    let running = false;
 
-    // Each tracer: { startTime, traj, positions, trailPositions, trailEntity, headEntity, startEntity }
-    const tracers = [];
+    const tracers = [];  // active tracers (with trajectory data and entities)
+    const pending = [];  // placed but not yet fetched: {lon, lat, entity}
+
+    function updateControls() {
+        const placing = (state === 'PLACING');
+        durationEl.disabled = !placing;
+        maxTracersEl.disabled = !placing;
+    }
 
     // --- Reset ---
     document.getElementById('reset').addEventListener('click', () => {
         globalTime = 0;
-        running = false;
+        state = 'PLACING';
         tracers.length = 0;
+        pending.length = 0;
         viewer.entities.removeAll();
         statusEl.textContent = '';
+        goBtn.disabled = true;
+        hintEl.textContent = 'Click the ocean to place tracers, then hit Go!';
+        updateControls();
     });
 
-    // --- Click to add tracer ---
-    viewer.screenSpaceEventHandler.setInputAction(async (click) => {
+    // --- Click to place tracer ---
+    viewer.screenSpaceEventHandler.setInputAction((click) => {
+        if (state !== 'PLACING') return;
+
+        const maxCount = parseInt(maxTracersEl.value, 10) || 5;
+        if (pending.length >= maxCount) return;
+
         const cartesian = viewer.camera.pickEllipsoid(
             click.position, viewer.scene.globe.ellipsoid
         );
@@ -80,109 +102,128 @@
         const lon = Cesium.Math.toDegrees(carto.longitude);
         const lat = Cesium.Math.toDegrees(carto.latitude);
 
+        const marker = viewer.entities.add({
+            position: Cesium.Cartesian3.fromDegrees(lon, lat),
+            point: { pixelSize: 8, color: Cesium.Color.YELLOW },
+        });
+
+        pending.push({ lon, lat, entity: marker });
+        goBtn.disabled = false;
+        statusEl.textContent = `${pending.length}/${maxCount} tracers placed`;
+
+        if (pending.length >= maxCount) {
+            hintEl.textContent = 'Max reached. Hit Go!';
+        }
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+    // --- Go! button: fetch all trajectories and start animation ---
+    goBtn.addEventListener('click', async () => {
+        if (state !== 'PLACING' || pending.length === 0) return;
+
+        state = 'COMPUTING';
+        goBtn.disabled = true;
+        updateControls();
+        statusEl.textContent = `Computing ${pending.length} trajectories...`;
+
         const duration = parseFloat(durationEl.value) || 30;
-        const t0 = globalTime;
 
-        statusEl.textContent = 'Computing trajectory...';
-
-        let data;
         try {
-            const url = `/trace?lon=${lon}&lat=${lat}&duration_days=${duration}&dt_hours=6&t0_hours=${t0}`;
-            const resp = await fetch(url);
-            if (!resp.ok) {
-                statusEl.textContent = `Error: ${resp.status} ${resp.statusText}`;
-                return;
+            const promises = pending.map(p => {
+                const url = `/trace?lon=${p.lon}&lat=${p.lat}&duration_days=${duration}&dt_hours=6&t0_hours=0`;
+                return fetch(url).then(r => {
+                    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+                    return r.json();
+                });
+            });
+            const results = await Promise.all(promises);
+
+            // Remove yellow placement markers
+            for (const p of pending) {
+                viewer.entities.remove(p.entity);
             }
-            data = await resp.json();
+
+            // Build tracer objects
+            for (const data of results) {
+                const traj = data.trajectory;
+                if (!traj || traj.length < 2) continue;
+
+                const positions = traj.map(p => Cesium.Cartesian3.fromDegrees(p[0], p[1]));
+                let visiblePositions = [positions[0]];
+
+                const startEntity = viewer.entities.add({
+                    position: positions[0],
+                    point: { pixelSize: 6, color: Cesium.Color.GREY },
+                });
+
+                const trailEntity = viewer.entities.add({
+                    polyline: {
+                        positions: new Cesium.CallbackProperty(() => visiblePositions, false),
+                        width: 3,
+                        material: new Cesium.PolylineGlowMaterialProperty({
+                            glowPower: 0.15,
+                            color: Cesium.Color.CYAN.withAlpha(0.6),
+                        }),
+                        clampToGround: true,
+                    },
+                });
+
+                const headEntity = viewer.entities.add({
+                    position: positions[0],
+                    point: { pixelSize: 10, color: Cesium.Color.CYAN },
+                });
+
+                tracers.push({
+                    startTime: 0,
+                    traj,
+                    positions,
+                    visiblePositions,
+                    trailEntity,
+                    headEntity,
+                    startEntity,
+                    finished: false,
+                    setVisible(arr) { this.visiblePositions = arr; visiblePositions = arr; },
+                });
+            }
+
+            pending.length = 0;
+            globalTime = 0;
+            state = 'ANIMATING';
+            updateControls();
+            requestAnimationFrame(tick);
+
         } catch (e) {
             statusEl.textContent = `Request failed: ${e.message}`;
-            return;
+            state = 'PLACING';
+            goBtn.disabled = pending.length === 0;
+            updateControls();
         }
-
-        const traj = data.trajectory;
-        if (!traj || traj.length < 2) {
-            statusEl.textContent = 'No trajectory returned.';
-            return;
-        }
-
-        const positions = traj.map(p => Cesium.Cartesian3.fromDegrees(p[0], p[1]));
-
-        // Mutable array that the CallbackProperty reads each frame.
-        let visiblePositions = [positions[0]];
-
-        const startEntity = viewer.entities.add({
-            position: positions[0],
-            point: { pixelSize: 6, color: Cesium.Color.GREY },
-        });
-
-        const trailEntity = viewer.entities.add({
-            polyline: {
-                positions: new Cesium.CallbackProperty(() => visiblePositions, false),
-                width: 3,
-                material: new Cesium.PolylineGlowMaterialProperty({
-                    glowPower: 0.15,
-                    color: Cesium.Color.CYAN.withAlpha(0.6),
-                }),
-                clampToGround: true,
-            },
-        });
-
-        const headEntity = viewer.entities.add({
-            position: positions[0],
-            point: { pixelSize: 10, color: Cesium.Color.CYAN },
-        });
-
-        tracers.push({
-            startTime: t0,
-            traj,
-            positions,
-            visiblePositions,
-            trailEntity,
-            headEntity,
-            startEntity,
-            finished: false,
-            // Update the visiblePositions reference from the animate loop.
-            setVisible(arr) { this.visiblePositions = arr; visiblePositions = arr; },
-        });
-
-        // Start the clock if it isn't running.
-        if (!running) {
-            running = true;
-            requestAnimationFrame(tick);
-        }
-
-        statusEl.textContent = `Tracer added — day ${(t0 / 24).toFixed(1)}`;
-    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    });
 
     // --- Animation loop ---
     function tick() {
-        if (!running) return;
+        if (state !== 'ANIMATING') return;
 
         const speed = parseInt(speedEl.value, 10);
-        // Advance global time (hours per frame).
         globalTime += speed * 0.3;
 
-        // Clamp to data range.
         if (globalTime > maxHours) {
             globalTime = maxHours;
-            running = false;
+            state = 'DONE';
+            updateControls();
         }
 
         let allFinished = true;
 
         for (const tr of tracers) {
-            // How far into this tracer's trajectory are we?
             const elapsed = globalTime - tr.startTime;
             if (elapsed < 0) {
                 allFinished = false;
-                continue; // tracer hasn't started yet
+                continue;
             }
 
             const lastTime = tr.traj[tr.traj.length - 1][2];
             const firstTime = tr.traj[0][2];
-            const trajDuration = lastTime - firstTime;
 
-            // Find the index corresponding to elapsed time.
             let idx = 0;
             for (let i = 0; i < tr.traj.length; i++) {
                 if (tr.traj[i][2] - firstTime <= elapsed) {
@@ -200,7 +241,6 @@
                 tr.headEntity.point.color = Cesium.Color.CYAN;
             } else if (!tr.finished) {
                 tr.finished = true;
-                // Dim the head when this tracer is done.
                 tr.headEntity.point.color = Cesium.Color.CYAN.withAlpha(0.4);
                 tr.headEntity.point.pixelSize = 6;
             }
@@ -211,11 +251,12 @@
         statusEl.textContent = `Day ${days} / ${maxDays} — ${tracers.length} tracer${tracers.length !== 1 ? 's' : ''}`;
 
         if (allFinished && tracers.length > 0) {
-            running = false;
-            statusEl.textContent = `Done — day ${days}. Click to add more tracers.`;
+            state = 'DONE';
+            updateControls();
+            statusEl.textContent = `Done — day ${days}. Click Reset to start over.`;
         }
 
-        if (running) {
+        if (state === 'ANIMATING') {
             requestAnimationFrame(tick);
         }
     }
