@@ -10,17 +10,75 @@ web server (small spatial/temporal subsets per trace request).
 """
 
 import argparse
+import json
+import os
 import shutil
 from pathlib import Path
 
 import numpy as np
 import xarray as xr
-import zarr
 
 # Target chunk sizes: ~10° spatial, 5 days temporal.
 TIME_CHUNK = 5
 LAT_CHUNK = 120
 LON_CHUNK = 120
+
+
+def _write_zarr_array(store_path: Path, name: str, data: np.ndarray,
+                      chunks: tuple, fill_value=0.0, attrs: dict | None = None):
+    """Write a zarr array directly using filesystem operations (no zarr API)."""
+    import zlib
+
+    arr_dir = store_path / name
+    arr_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write .zarray metadata (zarr v2 format).
+    meta = {
+        "zarr_format": 2,
+        "shape": list(data.shape),
+        "chunks": list(chunks),
+        "dtype": data.dtype.str,
+        "compressor": None,
+        "fill_value": None if np.isnan(fill_value) else fill_value,
+        "order": "C",
+        "filters": None,
+    }
+    (arr_dir / ".zarray").write_text(json.dumps(meta))
+
+    if attrs:
+        (arr_dir / ".zattrs").write_text(json.dumps(attrs))
+
+    # Write chunk files.
+    ndim = data.ndim
+    if ndim == 1:
+        for ci in range(0, data.shape[0], chunks[0]):
+            chunk_data = data[ci:ci + chunks[0]]
+            chunk_key = str(ci // chunks[0])
+            (arr_dir / chunk_key).write_bytes(chunk_data.tobytes())
+    # For multi-dim, we only create the array; data is written later via zarr.
+
+
+def _create_empty_zarr_array(store_path: Path, name: str, shape: tuple,
+                             chunks: tuple, dtype: str, fill_value: float,
+                             attrs: dict | None = None):
+    """Create an empty zarr v2 array on disk (metadata only, no chunk files)."""
+    arr_dir = store_path / name
+    arr_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = {
+        "zarr_format": 2,
+        "shape": list(shape),
+        "chunks": list(chunks),
+        "dtype": dtype,
+        "compressor": None,
+        "fill_value": fill_value,
+        "order": "C",
+        "filters": None,
+    }
+    (arr_dir / ".zarray").write_text(json.dumps(meta))
+
+    if attrs:
+        (arr_dir / ".zattrs").write_text(json.dumps(attrs))
 
 
 def convert(input_dir: str = "data", output_path: str = "data/currents.zarr"):
@@ -55,40 +113,50 @@ def convert(input_dir: str = "data", output_path: str = "data/currents.zarr"):
 
     print(f"Global grid: time={nt}, lat={nlat}, lon={nlon}")
 
-    # --- Create empty Zarr store with full dimensions ---
+    # --- Create Zarr v2 store manually (works with any zarr version) ---
     if output_path.exists():
         shutil.rmtree(output_path)
+    output_path.mkdir(parents=True)
 
-    store = zarr.open(str(output_path), mode="w")
+    # Root group metadata.
+    (output_path / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
 
-    # Coordinate arrays — use NaN fill_value so xarray doesn't mask real 0.0 values.
-    store.create_dataset("time", data=time_arr.astype("datetime64[ns]"),
-                         chunks=(nt,), overwrite=True)
-    store.create_dataset("latitude", data=full_lat,
-                         chunks=(nlat,), fill_value=np.nan, overwrite=True)
-    store.create_dataset("longitude", data=full_lon,
-                         chunks=(nlon,), fill_value=np.nan, overwrite=True)
+    dims_attr = lambda dims: {"_ARRAY_DIMENSIONS": dims}
 
-    # Data arrays — created empty with fill_value=0, written per-tile below.
-    store.zeros(
-        "uo",
+    # Coordinate arrays.
+    # Store time as datetime64[ns] — zarr v2 supports this dtype natively.
+    time_data = time_arr.astype("datetime64[ns]")
+    _write_zarr_array(output_path, "time", time_data,
+                      chunks=(nt,), fill_value=0,
+                      attrs=dims_attr(["time"]))
+
+    _write_zarr_array(output_path, "latitude", full_lat,
+                      chunks=(nlat,), fill_value=np.nan,
+                      attrs=dims_attr(["latitude"]))
+
+    _write_zarr_array(output_path, "longitude", full_lon,
+                      chunks=(nlon,), fill_value=np.nan,
+                      attrs=dims_attr(["longitude"]))
+
+    # Empty data arrays (metadata only — chunks written per-tile below).
+    _create_empty_zarr_array(
+        output_path, "uo",
         shape=(nt, nlat, nlon),
         chunks=(TIME_CHUNK, LAT_CHUNK, LON_CHUNK),
-        dtype="float32",
+        dtype="<f4", fill_value=0.0,
+        attrs=dims_attr(["time", "latitude", "longitude"]),
     )
-    store.zeros(
-        "vo",
+    _create_empty_zarr_array(
+        output_path, "vo",
         shape=(nt, nlat, nlon),
         chunks=(TIME_CHUNK, LAT_CHUNK, LON_CHUNK),
-        dtype="float32",
+        dtype="<f4", fill_value=0.0,
+        attrs=dims_attr(["time", "latitude", "longitude"]),
     )
 
-    # xarray needs _ARRAY_DIMENSIONS to interpret Zarr as a Dataset.
-    store["uo"].attrs["_ARRAY_DIMENSIONS"] = ["time", "latitude", "longitude"]
-    store["vo"].attrs["_ARRAY_DIMENSIONS"] = ["time", "latitude", "longitude"]
-    store["time"].attrs["_ARRAY_DIMENSIONS"] = ["time"]
-    store["latitude"].attrs["_ARRAY_DIMENSIONS"] = ["latitude"]
-    store["longitude"].attrs["_ARRAY_DIMENSIONS"] = ["longitude"]
+    # Now open with zarr (any version) for writing data.
+    import zarr
+    store = zarr.open(str(output_path), mode="r+")
 
     # Build index lookups for fast coordinate mapping.
     lon_to_idx = {round(v, 4): i for i, v in enumerate(full_lon)}
