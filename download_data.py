@@ -10,7 +10,9 @@ Adjust the date range, bounding box, and output directory as needed.
 """
 
 import argparse
+import glob
 import json
+import os
 from datetime import datetime, timedelta
 
 import copernicusmarine
@@ -63,13 +65,21 @@ def download_chunked(
     """Download in spatial/temporal chunks to avoid memory issues.
 
     Any chunk dimension set to None downloads that full range in one go.
+    Automatically resumes by skipping chunks that already exist on disk.
+    Also cleans up partial downloads from interrupted runs.
     """
+    # Clean up partial downloads (temp files with random suffixes)
+    _clean_partial_downloads(output_dir)
+
+    existing = _existing_files(output_dir)
+
     lon_edges = _chunk_edges(min_lon, max_lon, chunk_lon)
     lat_edges = _chunk_edges(min_lat, max_lat, chunk_lat)
     time_edges = _chunk_time_edges(start_date, end_date, chunk_days)
 
     total = (len(lon_edges) - 1) * (len(lat_edges) - 1) * (len(time_edges) - 1)
     count = 0
+    skipped = 0
 
     for ti in range(len(time_edges) - 1):
         t0 = time_edges[ti]
@@ -79,6 +89,12 @@ def download_chunked(
                 count += 1
                 lo0, lo1 = lon_edges[lo], lon_edges[lo + 1]
                 la0, la1 = lat_edges[li], lat_edges[li + 1]
+
+                if _chunk_exists(existing, lo0, lo1, la0, la1, t0, t1):
+                    skipped += 1
+                    print(f"[{count}/{total}] SKIP (exists) lon [{lo0}, {lo1}] lat [{la0}, {la1}]")
+                    continue
+
                 print(f"[{count}/{total}] lon [{lo0}, {lo1}] lat [{la0}, {la1}] time [{t0}, {t1}]")
                 download(
                     start_date=t0,
@@ -89,6 +105,9 @@ def download_chunked(
                     max_lat=la1,
                     output_dir=output_dir,
                 )
+
+    if skipped:
+        print(f"Done. Skipped {skipped} existing chunks, downloaded {total - skipped}.")
 
 
 def _chunk_edges(lo: float, hi: float, step: float | None) -> list[float]:
@@ -118,6 +137,74 @@ def _chunk_time_edges(start: str, end: str, step_days: float | None) -> list[str
         cur += dt
     edges.append(e.strftime("%Y-%m-%d"))
     return edges
+
+
+def _existing_files(output_dir: str) -> set[str]:
+    """Return the set of .nc filenames in the output directory."""
+    return {
+        f for f in os.listdir(output_dir)
+        if f.endswith(".nc") and not _is_partial(f)
+    } if os.path.isdir(output_dir) else set()
+
+
+def _is_partial(filename: str) -> bool:
+    """Check if a file looks like a partial/temp download."""
+    # Copernicus writes to .nc.XXXXX then renames on completion
+    parts = filename.rsplit(".nc", 1)
+    return len(parts) == 2 and parts[1] != ""
+
+
+def _clean_partial_downloads(output_dir: str):
+    """Remove temp files from interrupted downloads."""
+    if not os.path.isdir(output_dir):
+        return
+    for f in os.listdir(output_dir):
+        if ".nc." in f and not f.endswith(".nc"):
+            path = os.path.join(output_dir, f)
+            print(f"Removing partial download: {f}")
+            os.remove(path)
+
+
+def _chunk_exists(
+    existing: set[str],
+    lo0: float, lo1: float,
+    la0: float, la1: float,
+    t0: str, t1: str,
+) -> bool:
+    """Check if any existing file covers this chunk's bounds and time range."""
+    for f in existing:
+        if t0 in f and t1 in f and _bounds_in_filename(f, lo0, lo1, la0, la1):
+            return True
+    return False
+
+
+def _bounds_in_filename(
+    filename: str,
+    lo0: float, lo1: float,
+    la0: float, la1: float,
+) -> bool:
+    """Check if a filename contains lon/lat strings matching this chunk.
+
+    Copernicus filenames encode bounds like:
+    ..._30.00W-0.00E_80.00S-50.00S_...
+    """
+    lon_str = _lon_to_str(lo0) + "-" + _lon_to_str(lo1)
+    lat_str = _lat_to_str(la0) + "-" + _lat_to_str(la1)
+    return lon_str in filename and lat_str in filename
+
+
+def _lon_to_str(v: float) -> str:
+    """Convert longitude to Copernicus filename format, e.g. 30.00W or 0.00E."""
+    if v < 0:
+        return f"{abs(v):.2f}W"
+    return f"{v:.2f}E"
+
+
+def _lat_to_str(v: float) -> str:
+    """Convert latitude to Copernicus filename format, e.g. 80.00S or 50.00N."""
+    if v < 0:
+        return f"{abs(v):.2f}S"
+    return f"{v:.2f}N"
 
 
 if __name__ == "__main__":
