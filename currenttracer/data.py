@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -15,12 +16,68 @@ MAX_SPEED_KMH = 5 * 1.609344
 KM_PER_DEG_LAT = 111.32
 
 
+def _parse_bounds(filename: str) -> tuple[float, float, float, float] | None:
+    """Extract (lon_min, lon_max, lat_min, lat_max) from a Copernicus filename.
+
+    Example filename fragment: 80.00W-0.00E_20.00N-60.00N
+    """
+    def _parse_lon(s: str) -> float:
+        if s.endswith("W"):
+            return -float(s[:-1])
+        return float(s[:-1])
+
+    def _parse_lat(s: str) -> float:
+        if s.endswith("S"):
+            return -float(s[:-1])
+        return float(s[:-1])
+
+    # Match lon range and lat range patterns in the filename.
+    m = re.search(
+        r"(\d+\.\d+[WE])-(\d+\.\d+[WE])_(\d+\.\d+[NS])-(\d+\.\d+[NS])",
+        filename,
+    )
+    if not m:
+        return None
+    return (
+        _parse_lon(m.group(1)),
+        _parse_lon(m.group(2)),
+        _parse_lat(m.group(3)),
+        _parse_lat(m.group(4)),
+    )
+
+
+class _FileEntry:
+    """Index entry for one NetCDF file."""
+
+    __slots__ = ("path", "lon_min", "lon_max", "lat_min", "lat_max")
+
+    def __init__(
+        self, path: Path,
+        lon_min: float, lon_max: float,
+        lat_min: float, lat_max: float,
+    ) -> None:
+        self.path = path
+        self.lon_min = lon_min
+        self.lon_max = lon_max
+        self.lat_min = lat_min
+        self.lat_max = lat_max
+
+    def overlaps(
+        self,
+        lon_min: float, lon_max: float,
+        lat_min: float, lat_max: float,
+    ) -> bool:
+        return (
+            self.lon_min <= lon_max and self.lon_max >= lon_min
+            and self.lat_min <= lat_max and self.lat_max >= lat_min
+        )
+
+
 class OceanCurrents:
     """Lazy-loading ocean current data.
 
-    Opens NetCDF files without loading velocity arrays into memory.
-    Call :meth:`local_field` to load a small spatial/temporal subset
-    for a specific trace request.
+    Indexes NetCDF files by spatial bounds from their filenames.
+    Only opens the files needed for each trace request.
     """
 
     def __init__(self, data_dir: str | Path) -> None:
@@ -29,19 +86,35 @@ class OceanCurrents:
         if not files:
             raise FileNotFoundError(f"No .nc files found in {data_dir}")
 
-        self._ds = xr.open_mfdataset(files, combine="by_coords")
+        self._index: list[_FileEntry] = []
+        for f in files:
+            bounds = _parse_bounds(f.name)
+            if bounds is not None:
+                self._index.append(_FileEntry(f, *bounds))
 
-        if "depth" in self._ds.dims:
-            self._ds = self._ds.isel(depth=0)
+        if not self._index:
+            raise FileNotFoundError(
+                f"No .nc files with parseable bounds in {data_dir}"
+            )
 
-        # Coordinate arrays are small — safe to load into memory.
-        self.lon = self._ds["longitude"].values.astype(np.float64)
-        self.lat = self._ds["latitude"].values.astype(np.float64)
+        # Read time coordinates from the first file (all tiles share
+        # the same time range since data was downloaded with no time chunking).
+        with xr.open_dataset(self._index[0].path) as ds:
+            self.time_ref = ds["time"].values[0]
+            self.time_hours = (
+                (ds["time"].values - self.time_ref) / np.timedelta64(1, "h")
+            ).astype(np.float64)
 
-        self.time_ref = self._ds["time"].values[0]
-        self.time_hours = (
-            (self._ds["time"].values - self.time_ref) / np.timedelta64(1, "h")
-        ).astype(np.float64)
+    def _find_files(
+        self,
+        lon_min: float, lon_max: float,
+        lat_min: float, lat_max: float,
+    ) -> list[Path]:
+        """Return paths of files overlapping the given bounding box."""
+        return [
+            e.path for e in self._index
+            if e.overlaps(lon_min, lon_max, lat_min, lat_max)
+        ]
 
     def local_field(
         self,
@@ -62,47 +135,40 @@ class OceanCurrents:
 
         lon_min = lon - dx
         lon_max = lon + dx
-        lat_min = max(lat - dy, float(self.lat.min()))
-        lat_max = min(lat + dy, float(self.lat.max()))
-        t_end = t0_hours + dt_hours
+        lat_min = lat - dy
+        lat_max = lat + dy
 
-        lon_mask = (self.lon >= lon_min) & (self.lon <= lon_max)
-        lat_mask = (self.lat >= lat_min) & (self.lat <= lat_max)
-        time_mask = (self.time_hours >= t0_hours) & (self.time_hours <= t_end)
-
-        lon_idx = np.where(lon_mask)[0]
-        lat_idx = np.where(lat_mask)[0]
-        time_idx = np.where(time_mask)[0]
-
-        # Expand by 1 on each side for interpolation edges.
-        if len(lon_idx) > 0:
-            lon_idx = np.arange(
-                max(lon_idx[0] - 1, 0),
-                min(lon_idx[-1] + 2, len(self.lon)),
-            )
-        if len(lat_idx) > 0:
-            lat_idx = np.arange(
-                max(lat_idx[0] - 1, 0),
-                min(lat_idx[-1] + 2, len(self.lat)),
-            )
-        if len(time_idx) > 0:
-            time_idx = np.arange(
-                max(time_idx[0] - 1, 0),
-                min(time_idx[-1] + 2, len(self.time_hours)),
+        paths = self._find_files(lon_min, lon_max, lat_min, lat_max)
+        if not paths:
+            raise ValueError(
+                f"No data files cover region around ({lon}, {lat})"
             )
 
-        sub = self._ds.isel(
-            longitude=lon_idx, latitude=lat_idx, time=time_idx
+        # Open only the matching files, select the spatial/temporal subset.
+        ds = xr.open_mfdataset(paths, combine="by_coords")
+        if "depth" in ds.dims:
+            ds = ds.isel(depth=0)
+
+        # Spatial subset.
+        ds = ds.sel(
+            longitude=slice(lon_min, lon_max),
+            latitude=slice(lat_min, lat_max),
         )
 
-        sub_lon = sub["longitude"].values.astype(np.float64)
-        sub_lat = sub["latitude"].values.astype(np.float64)
+        # Temporal subset.
+        t_start = self.time_ref + np.timedelta64(int(t0_hours * 3600), "s")
+        t_end = self.time_ref + np.timedelta64(int((t0_hours + dt_hours) * 3600), "s")
+        ds = ds.sel(time=slice(t_start, t_end))
+
+        sub_lon = ds["longitude"].values.astype(np.float64)
+        sub_lat = ds["latitude"].values.astype(np.float64)
         sub_time = (
-            (sub["time"].values - self.time_ref) / np.timedelta64(1, "h")
+            (ds["time"].values - self.time_ref) / np.timedelta64(1, "h")
         ).astype(np.float64)
 
-        uo = np.nan_to_num(sub["uo"].values.astype(np.float64))
-        vo = np.nan_to_num(sub["vo"].values.astype(np.float64))
+        uo = np.nan_to_num(ds["uo"].values.astype(np.float64))
+        vo = np.nan_to_num(ds["vo"].values.astype(np.float64))
+        ds.close()
 
         return LocalField(sub_lon, sub_lat, sub_time, uo, vo)
 
