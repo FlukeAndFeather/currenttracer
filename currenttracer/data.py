@@ -24,7 +24,7 @@ class OceanCurrents:
 
     def __init__(self, data_dir: str | Path) -> None:
         zarr_path = Path(data_dir) / "currents.zarr"
-        self._ds = xr.open_zarr(zarr_path)
+        self._ds = xr.open_zarr(zarr_path, consolidated=False)
 
         # Coordinate arrays are small — safe to load into memory.
         self.lon = self._ds["longitude"].values.astype(np.float64)
