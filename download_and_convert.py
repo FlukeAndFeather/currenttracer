@@ -168,7 +168,7 @@ def main():
             args.start, args.end, tmp_dir,
         )
 
-        with xr.open_dataset(nc_path) as ds:
+        with xr.open_dataset(nc_path, engine="netcdf4") as ds:
             # Get resolution from the first tile's coordinates.
             tile_lon = np.sort(ds["longitude"].values)
             tile_lat = np.sort(ds["latitude"].values)
@@ -287,7 +287,7 @@ def _process_tile(store_path, nc_path, lo0, lo1, la0, la1, full_lon, full_lat):
     """Read a NetCDF tile and write its data into the Zarr store."""
     import zarr
 
-    ds = xr.open_dataset(nc_path)
+    ds = xr.open_dataset(nc_path, engine="netcdf4")
 
     if "depth" in ds.dims:
         ds = ds.isel(depth=0).drop_vars("depth", errors="ignore")
