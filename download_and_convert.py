@@ -101,7 +101,10 @@ def _create_empty_zarr_array(store_path, name, shape, chunks, dtype,
         "shape": list(shape),
         "chunks": list(chunks),
         "dtype": dtype,
-        "compressor": None,
+        "compressor": {
+            "id": "zlib",
+            "level": 4,
+        },
         "fill_value": fill_value,
         "order": "C",
         "filters": None,
@@ -158,8 +161,8 @@ def _create_store(output):
     print("Zarr store created.")
 
 
-def _write_tile(store_path, ds):
-    """Write an in-memory xarray Dataset tile into the Zarr store."""
+def _write_tile(store, ds):
+    """Write an in-memory xarray Dataset tile into the opened Zarr store."""
     if "depth" in ds.dims:
         ds = ds.isel(depth=0).drop_vars("depth", errors="ignore")
 
@@ -174,13 +177,12 @@ def _write_tile(store_path, ds):
     lat_start = _nearest_idx(FULL_LAT, sorted_lats[0])
     lat_end = lat_start + len(sorted_lats)
 
-    store = zarr.open(str(store_path), mode="r+")
-
     for var in ("uo", "vo"):
-        data = ds[var].values
+        # Load one variable at a time to keep memory low.
+        data = ds[var].values.astype(np.float32)
         if flip_lat:
             data = data[:, ::-1, :]
-        data = np.nan_to_num(data, nan=0.0).astype(np.float32)
+        np.nan_to_num(data, nan=0.0, copy=False)
         store[var][:, lat_start:lat_end, lon_start:lon_end] = data
         del data
 
@@ -205,6 +207,8 @@ def main():
     if not (output.exists() and (output / ".zgroup").exists()):
         _create_store(output)
 
+    store = zarr.open(str(output), mode="r+")
+
     count = len(completed)
     for li in range(len(lat_edges) - 1):
         for lo in range(len(lon_edges) - 1):
@@ -219,7 +223,7 @@ def main():
             print(f"[{count}/{total}] lon [{lo0}, {lo1}] lat [{la0}, {la1}]...")
 
             ds = _download_tile(lo0, lo1, la0, la1)
-            _write_tile(output, ds)
+            _write_tile(store, ds)
             ds.close()
 
             completed.add(tile_key)
