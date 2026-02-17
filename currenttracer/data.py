@@ -8,8 +8,9 @@ import numpy as np
 import xarray as xr
 from scipy.interpolate import RegularGridInterpolator
 
-# Maximum assumed current speed in km/h (5 mph ≈ 8.05 km/h).
-MAX_SPEED_KMH = 5 * 1.609344
+# Maximum assumed current speed in km/h (1.5 mph ≈ 2.41 km/h).
+# Conservative estimate; advection reloads if tracer nears chunk edge.
+MAX_SPEED_KMH = 1.5 * 1.609344
 
 # Approximate km per degree of latitude.
 KM_PER_DEG_LAT = 111.32
