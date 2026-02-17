@@ -33,9 +33,9 @@ def main():
 
     # Coarsen spatially (only lat/lon, not time).
     print(f"  Coarsening by {args.factor}x...")
-    time_coord = ds["time"]
+    time_vals = ds["time"].values.copy()  # snapshot before coarsen mangles it
     ds = ds.coarsen(latitude=args.factor, longitude=args.factor, boundary="trim").mean()
-    ds["time"] = time_coord  # restore original time (coarsen can mangle it)
+    ds = ds.assign_coords(time=time_vals)  # restore original time values
     print(f"  Coarsened shape: lat={ds.sizes['latitude']}, lon={ds.sizes['longitude']}")
 
     # Replace NaN with 0 and convert to float32.
