@@ -31,9 +31,11 @@ def main():
     ds = ds.isel(time=slice(0, args.days))
     print(f"  After time slice: {ds.sizes['time']} days")
 
-    # Coarsen spatially.
+    # Coarsen spatially (only lat/lon, not time).
     print(f"  Coarsening by {args.factor}x...")
+    time_coord = ds["time"]
     ds = ds.coarsen(latitude=args.factor, longitude=args.factor, boundary="trim").mean()
+    ds["time"] = time_coord  # restore original time (coarsen can mangle it)
     print(f"  Coarsened shape: lat={ds.sizes['latitude']}, lon={ds.sizes['longitude']}")
 
     # Replace NaN with 0 and convert to float32.
