@@ -56,7 +56,7 @@ async def config():
         "max_hours": float(currents.time_hours[-1]),
     })
 
-MAX_DURATION_HOURS = 365 * 24  # 1 year
+MAX_DURATION_HOURS = 60 * 24  # 60 days
 MIN_DT_HOURS = 1.0
 
 
@@ -66,7 +66,7 @@ async def trace_endpoint(
     request: Request,
     lon: float = Query(..., ge=-180, le=180),
     lat: float = Query(..., ge=-90, le=90),
-    duration_days: float = Query(default=30, gt=0, le=365),
+    duration_days: float = Query(default=30, gt=0, le=60),
     dt_hours: float = Query(default=6, ge=MIN_DT_HOURS),
     t0_hours: float = Query(default=0, ge=0),
 ):

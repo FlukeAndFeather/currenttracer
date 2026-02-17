@@ -17,7 +17,7 @@
 <div id="controls">
     <label>
         Duration (days):
-        <input id="duration" type="number" value="30" min="1" max="365" style="width:60px">
+        <input id="duration" type="number" value="30" min="1" max="60" style="width:60px">
     </label>
     <label>
         Max tracers:
@@ -51,7 +51,16 @@
         fullscreenButton: false,
         selectionIndicator: false,
         infoBox: false,
+        baseLayer: false,
     });
+
+    viewer.imageryLayers.addImageryProvider(
+        new Cesium.UrlTemplateImageryProvider({
+            url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+            subdomains: ['a', 'b', 'c', 'd'],
+            credit: 'CARTO',
+        })
+    );
 
     const statusEl = document.getElementById('status');
     const durationEl = document.getElementById('duration');
